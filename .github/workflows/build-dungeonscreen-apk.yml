@@ -1,0 +1,102 @@
+name: Build DungeonScreen Android APK
+
+# Run from GitHub's Actions tab, or rebuild automatically when the source changes.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'DungeonScreen-Android-Source-v1.4.2.zip'
+      - 'android/**'
+      - '.github/workflows/build-dungeonscreen-apk.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  android-apk:
+    name: Android debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Prepare Android project from source ZIP (or an existing android folder)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f android/settings.gradle ]]; then
+            android_dir="$GITHUB_WORKSPACE/android"
+            echo "Found an extracted Android project."
+          else
+            archive='DungeonScreen-Android-Source-v1.4.2.zip'
+            if [[ ! -f "$archive" ]]; then
+              echo "ERROR: Upload $archive to the repository root." >&2
+              exit 1
+            fi
+            mkdir -p .android-build-source
+            unzip -q "$archive" -d .android-build-source
+            if [[ -f .android-build-source/DungeonScreen-Mobile/android/settings.gradle ]]; then
+              android_dir="$GITHUB_WORKSPACE/.android-build-source/DungeonScreen-Mobile/android"
+            elif [[ -f .android-build-source/android/settings.gradle ]]; then
+              android_dir="$GITHUB_WORKSPACE/.android-build-source/android"
+            else
+              echo "ERROR: The uploaded ZIP does not contain the DungeonScreen Android project." >&2
+              exit 1
+            fi
+            echo "Extracted the Android project from $archive."
+          fi
+          test -f "$android_dir/app/build.gradle"
+          test -f "$android_dir/app/src/main/AndroidManifest.xml"
+          echo "ANDROID_PROJECT_DIR=$android_dir" >> "$GITHUB_ENV"
+          echo "Android project: $android_dir"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android API 35 and build tools
+        shell: bash
+        run: |
+          sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+
+      # DungeonScreen v1.4.2 uses Android Gradle Plugin 8.7.3,
+      # which requires Gradle 8.9 and Java 17.
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Compile Android debug APK
+        shell: bash
+        run: |
+          gradle --project-dir "$ANDROID_PROJECT_DIR" --no-daemon :app:assembleDebug --stacktrace
+
+      - name: Collect APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          built_apk="$ANDROID_PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
+          if [[ ! -s "$built_apk" ]]; then
+            echo 'ERROR: Android build did not produce an APK.' >&2
+            exit 1
+          fi
+          cp "$built_apk" DungeonScreen-v1.4.2-debug.apk
+          ls -lh DungeonScreen-v1.4.2-debug.apk
+
+      - name: Upload APK as a downloadable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DungeonScreen-v1.4.2-Android-APK
+          path: DungeonScreen-v1.4.2-debug.apk
+          if-no-files-found: error
+          retention-days: 14
