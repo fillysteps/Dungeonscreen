@@ -1,61 +1,89 @@
 name: Build DungeonScreen Android APK
 
-# Run from GitHub's Actions tab, or rebuild automatically when the source changes.
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-      - master
+    branches: [main, master]
     paths:
-      - 'DungeonScreen-Android-Source-v1.4.2.zip'
+      - '**/*.zip'
       - 'android/**'
+      - 'DungeonScreen-Mobile/android/**'
       - '.github/workflows/build-dungeonscreen-apk.yml'
 
 permissions:
   contents: read
 
 jobs:
-  android-apk:
-    name: Android debug APK
+  build-apk:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
+    timeout-minutes: 40
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Prepare Android project from source ZIP (or an existing android folder)
+      - name: Locate or extract DungeonScreen Android project
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -f android/settings.gradle ]]; then
-            android_dir="$GITHUB_WORKSPACE/android"
-            echo "Found an extracted Android project."
-          else
-            archive='DungeonScreen-Android-Source-v1.4.2.zip'
-            if [[ ! -f "$archive" ]]; then
-              echo "ERROR: Upload $archive to the repository root." >&2
-              exit 1
-            fi
-            mkdir -p .android-build-source
-            unzip -q "$archive" -d .android-build-source
-            if [[ -f .android-build-source/DungeonScreen-Mobile/android/settings.gradle ]]; then
-              android_dir="$GITHUB_WORKSPACE/.android-build-source/DungeonScreen-Mobile/android"
-            elif [[ -f .android-build-source/android/settings.gradle ]]; then
-              android_dir="$GITHUB_WORKSPACE/.android-build-source/android"
-            else
-              echo "ERROR: The uploaded ZIP does not contain the DungeonScreen Android project." >&2
-              exit 1
-            fi
-            echo "Extracted the Android project from $archive."
-          fi
-          test -f "$android_dir/app/build.gradle"
-          test -f "$android_dir/app/src/main/AndroidManifest.xml"
-          echo "ANDROID_PROJECT_DIR=$android_dir" >> "$GITHUB_ENV"
-          echo "Android project: $android_dir"
+          work="$RUNNER_TEMP/dungeonscreen-source"
+          mkdir -p "$work"
 
-      - name: Set up Java 17
+          # Accept source uploaded as extracted files, a source ZIP, or the outer build-kit ZIP.
+          locate_project() {
+            local candidate
+            while IFS= read -r -d '' candidate; do
+              local dir="${candidate%/settings.gradle}"
+              if [[ -f "$dir/app/build.gradle" && -f "$dir/app/src/main/AndroidManifest.xml" ]]; then
+                printf '%s\n' "$dir"
+                return 0
+              fi
+            done < <(find "$GITHUB_WORKSPACE" "$work" -type f -path '*/android/settings.gradle' -print0)
+            return 1
+          }
+
+          project_dir="$(locate_project || true)"
+          if [[ -z "$project_dir" ]]; then
+            # Look for a source ZIP; if the user uploaded the outer build-kit, extract it first.
+            i=0
+            while IFS= read -r -d '' archive; do
+              i=$((i+1))
+              target="$work/upload-$i"
+              mkdir -p "$target"
+              echo "Inspecting ZIP: $archive"
+              if ! unzip -tq "$archive" >/dev/null; then
+                echo "WARNING: ZIP is unreadable: $archive"
+                continue
+              fi
+              unzip -q "$archive" -d "$target"
+              project_dir="$(locate_project || true)"
+              if [[ -n "$project_dir" ]]; then break; fi
+              # An outer build kit contains a second (source) ZIP.
+              j=0
+              while IFS= read -r -d '' inner; do
+                j=$((j+1))
+                nested="$target/extracted-inner-$j"
+                mkdir -p "$nested"
+                echo "Inspecting nested ZIP: $inner"
+                if unzip -tq "$inner" >/dev/null; then
+                  unzip -q "$inner" -d "$nested"
+                  project_dir="$(locate_project || true)"
+                  if [[ -n "$project_dir" ]]; then break; fi
+                fi
+              done < <(find "$target" -maxdepth 4 -type f -name '*.zip' -print0)
+              if [[ -n "$project_dir" ]]; then break; fi
+            done < <(find "$GITHUB_WORKSPACE" -maxdepth 3 -type f -name '*.zip' -print0)
+          fi
+
+          if [[ -z "$project_dir" ]]; then
+            echo '::error::Android project not found. Upload either DungeonScreen-Android-Source-v1.4.2.zip OR the complete DungeonScreen-v1.4.2-GitHub-APK-Build-Kit.zip to the repository root, then rerun.'
+            echo 'Repository files:'
+            find "$GITHUB_WORKSPACE" -maxdepth 3 -type f -not -path '*/.git/*' | head -80
+            exit 1
+          fi
+          echo "Android project found: $project_dir"
+          printf 'ANDROID_PROJECT_DIR=%s\n' "$project_dir" >> "$GITHUB_ENV"
+
+      - name: Install Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -64,39 +92,30 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android API 35 and build tools
-        shell: bash
-        run: |
-          sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+      - name: Install Android SDK 35
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
 
-      # DungeonScreen v1.4.2 uses Android Gradle Plugin 8.7.3,
-      # which requires Gradle 8.9 and Java 17.
-      - name: Set up Gradle 8.9
+      - name: Install Gradle 8.9
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
 
-      - name: Compile Android debug APK
-        shell: bash
-        run: |
-          gradle --project-dir "$ANDROID_PROJECT_DIR" --no-daemon :app:assembleDebug --stacktrace
+      - name: Compile debug APK
+        run: gradle --project-dir "$ANDROID_PROJECT_DIR" --no-daemon :app:assembleDebug --stacktrace
 
-      - name: Collect APK
+      - name: Prepare APK
         shell: bash
         run: |
           set -euo pipefail
-          built_apk="$ANDROID_PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
-          if [[ ! -s "$built_apk" ]]; then
-            echo 'ERROR: Android build did not produce an APK.' >&2
-            exit 1
-          fi
-          cp "$built_apk" DungeonScreen-v1.4.2-debug.apk
+          src="$ANDROID_PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$src" || { echo '::error::No APK generated by Gradle.'; exit 1; }
+          cp "$src" DungeonScreen-v1.4.2-debug.apk
           ls -lh DungeonScreen-v1.4.2-debug.apk
 
-      - name: Upload APK as a downloadable artifact
+      - name: Upload downloadable APK
         uses: actions/upload-artifact@v4
         with:
-          name: DungeonScreen-v1.4.2-Android-APK
+          name: DungeonScreen-Android-APK
           path: DungeonScreen-v1.4.2-debug.apk
           if-no-files-found: error
           retention-days: 14
